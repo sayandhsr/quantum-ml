@@ -4,6 +4,7 @@
 
 A unified research, benchmark, and interactive demonstration platform comparing **Traditional Machine Learning Classifiers**, a **Baseline Variational Quantum Classifier (VQC)**, and an **Enhanced Data Re-Uploading Quantum Neural Network (Qiskit-DRQNN)** across clinical healthcare analytics and non-linear geometric topological manifolds.
 
+
 ---
 
 ## 1. Executive Summary & Core Results
