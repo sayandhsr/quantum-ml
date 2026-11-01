@@ -1,0 +1,41 @@
+{
+  "rows": 500,
+  "features": 8,
+  "feature_names": [
+    "Pregnancies",
+    "Glucose",
+    "BloodPressure",
+    "SkinThickness",
+    "Insulin",
+    "BMI",
+    "DiabetesPedigreeFunction",
+    "Age"
+  ],
+  "target": "Outcome",
+  "missing_values": {
+    "Pregnancies": 0,
+    "Glucose": 0,
+    "BloodPressure": 0,
+    "SkinThickness": 0,
+    "Insulin": 0,
+    "BMI": 0,
+    "DiabetesPedigreeFunction": 0,
+    "Age": 0,
+    "Outcome": 0
+  },
+  "duplicate_rows": 0,
+  "class_counts": {
+    "0": 331,
+    "1": 169
+  },
+  "zero_counts_in_measurement_fields": {
+    "Glucose": 0,
+    "BloodPressure": 0,
+    "SkinThickness": 0,
+    "Insulin": 0,
+    "BMI": 0
+  },
+  "random_state": 42,
+  "test_size": 0.2,
+  "preprocessing": "Raw feature values are saved. Imputation and scaling are fitted inside each training fold and final model pipeline."
+}

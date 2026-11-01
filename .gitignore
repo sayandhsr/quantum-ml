@@ -1,0 +1,22 @@
+# Virtual environments
+qiskit-env/
+venv/
+.env
+.venv/
+env/
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.ipynb_checkpoints/
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

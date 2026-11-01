@@ -1,0 +1,47 @@
+{
+  "accuracy": 0.69,
+  "precision": 0.5254237288135594,
+  "recall": 0.9117647058823529,
+  "f1_score": 0.6666666666666666,
+  "roc_auc": 0.7651515151515151,
+  "pr_auc": 0.5647810731327486,
+  "confusion_matrix": [
+    [
+      38,
+      28
+    ],
+    [
+      3,
+      31
+    ]
+  ],
+  "threshold": 0.27680271381259375,
+  "cv_roc_auc_mean": 0.779874213836478,
+  "cv_roc_auc_std": 0.029822166257734234,
+  "cv_pr_auc_mean": 0.676675973909633,
+  "cv_pr_auc_std": 0.053087196084653634,
+  "cv_accuracy_mean": 0.735,
+  "cv_accuracy_std": 0.04358898943540673,
+  "cv_f1_mean": 0.4766917293233083,
+  "cv_f1_std": 0.07255455129452279,
+  "cv_recall_mean": 0.3555555555555555,
+  "cv_recall_std": 0.05023948135648347,
+  "best_parameters": {
+    "classifier__class_weight": null,
+    "classifier__max_depth": 6,
+    "classifier__min_samples_leaf": 5
+  },
+  "training_seconds": 19.88271519999944,
+  "training_rows": 400,
+  "test_rows": 100,
+  "features": [
+    "Pregnancies",
+    "Glucose",
+    "BloodPressure",
+    "SkinThickness",
+    "Insulin",
+    "BMI",
+    "DiabetesPedigreeFunction",
+    "Age"
+  ]
+}

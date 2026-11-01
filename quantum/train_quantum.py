@@ -1,488 +1,326 @@
+"""Train a small local variational quantum classifier and controlled baseline."""
 
-import sys
-import json
+from __future__ import annotations
+
 import pickle
-from pathlib import Path
+import time
+from typing import Any
 
-import numpy as np
 import matplotlib.pyplot as plt
-
+import numpy as np
+import pandas as pd
 from scipy.optimize import minimize
-
 from sklearn.feature_selection import mutual_info_classif
-from sklearn.metrics import classification_report
-
-from qiskit import QuantumCircuit, transpile
-from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes
-from qiskit_aer import AerSimulator
-
-# =====================================================
-# PROJECT ROOT AND IMPORT PATH
-# =====================================================
-
-ROOT = Path(
-    r"C:\Users\Dell\OneDrive\Documents\tinkerspace"
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import (
+    GridSearchCV,
+    StratifiedKFold,
+    train_test_split,
 )
+from sklearn.naive_bayes import GaussianNB
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from shared.preprocess import load_processed
+from quantum.model import build_circuit, quantum_probability
 from shared.metrics import (
     calculate_metrics,
-    save_metrics,
     plot_confusion_matrix,
     plot_roc_curve,
-    print_metrics
+    save_metrics,
+)
+from shared.preprocess import (
+    FEATURES,
+    RANDOM_STATE,
+    ROOT_DIR,
+    load_raw_dataset,
+    split_dataset,
 )
 
-# =====================================================
-# CONFIGURATION
-# =====================================================
 
-MODEL_DIR = ROOT / "quantum" / "models"
-RESULT_DIR = ROOT / "quantum" / "results"
-
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-RESULT_DIR.mkdir(parents=True, exist_ok=True)
-
+MODEL_DIR = ROOT_DIR / "quantum" / "models"
+RESULT_DIR = ROOT_DIR / "quantum" / "results"
 N_QUBITS = 4
 MAX_TRAINING_SAMPLES = 80
-MAX_ITERATIONS = 20
-
-SIMULATOR = AerSimulator(
-    method="statevector"
-)
+MAX_ITERATIONS = 50
+FEATURE_REPS = 1
+ANSATZ_REPS = 1
 
 
-# =====================================================
-# FEATURE SELECTION
-# =====================================================
+def _choose_features(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    feature_names: list[str],
+) -> list[str]:
+    scores = mutual_info_classif(X_train, y_train, random_state=RANDOM_STATE)
+    chosen = sorted(range(len(scores)), key=lambda index: (-scores[index], index))
+    return [feature_names[index] for index in chosen[:N_QUBITS]]
 
-def select_features(X_train, y_train, X_test):
 
-    scores = mutual_info_classif(
+def _fit_controlled_classical(
+    X_train: Any,
+    y_train: Any,
+    X_test: Any,
+    y_test: Any,
+) -> dict[str, Any]:
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    candidates = {
+        "logistic_regression": (
+            Pipeline(
+                [
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                    ("classifier", LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)),
+                ]
+            ),
+            {"classifier__C": [0.1, 1.0, 10.0]},
+        ),
+        "gaussian_nb": (
+            Pipeline(
+                [
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                    ("classifier", GaussianNB()),
+                ]
+            ),
+            {"classifier__var_smoothing": [1e-9, 1e-8, 1e-7]},
+        ),
+    }
+    scoring = {"roc_auc": "roc_auc", "accuracy": "accuracy"}
+    best: GridSearchCV | None = None
+    best_name = ""
+    for name, (pipeline, parameters) in candidates.items():
+        search = GridSearchCV(
+            pipeline,
+            parameters,
+            scoring=scoring,
+            refit="roc_auc",
+            cv=cv,
+            n_jobs=1,
+        )
+        search.fit(X_train, y_train)
+        if best is None or search.best_score_ > best.best_score_:
+            best, best_name = search, name
+
+    if best is None:
+        raise RuntimeError("No controlled classical baseline was fitted.")
+    probabilities = best.best_estimator_.predict_proba(X_test)[:, 1]
+    predictions = (probabilities >= 0.5).astype(int)
+    metrics = calculate_metrics(y_test, predictions, probabilities)
+    metrics.update(
+        {
+            "model": best_name,
+            "threshold": 0.5,
+            "cv_roc_auc_mean": float(best.best_score_),
+            "cv_roc_auc_std": float(best.cv_results_["std_test_roc_auc"][best.best_index_]),
+            "best_parameters": best.best_params_,
+            "training_rows": len(X_train),
+            "test_rows": len(X_test),
+        }
+    )
+    return metrics
+
+
+def train_quantum() -> dict[str, Any]:
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    dataset = load_raw_dataset()
+    X_train, X_test, y_train, y_test = split_dataset(dataset)
+
+    subset_size = min(MAX_TRAINING_SAMPLES, len(X_train))
+    X_subset, _, y_subset, _ = train_test_split(
         X_train,
         y_train,
-        random_state=42
+        train_size=subset_size,
+        random_state=RANDOM_STATE,
+        stratify=y_train,
     )
 
-    selected_indices = np.argsort(scores)[-N_QUBITS:]
-
-    selected_features = [
-        X_train.columns[index]
-        for index in selected_indices
-    ]
-
-    return (
-        X_train[selected_features],
-        X_test[selected_features],
-        selected_features
+    imputer = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+    subset_imputed = pd.DataFrame(
+        imputer.fit_transform(X_subset),
+        columns=FEATURES,
+        index=X_subset.index,
     )
-
-
-# =====================================================
-# BUILD QUANTUM CIRCUIT
-# =====================================================
-
-def build_circuit():
-
-    feature_map = ZZFeatureMap(
-        feature_dimension=N_QUBITS,
-        reps=2,
-        entanglement="linear"
+    X_subset_scaled = scaler.fit_transform(subset_imputed)
+    test_imputed = pd.DataFrame(
+        imputer.transform(X_test),
+        columns=FEATURES,
+        index=X_test.index,
     )
-
-    ansatz = RealAmplitudes(
-        num_qubits=N_QUBITS,
-        reps=2,
-        entanglement="linear"
+    X_test_scaled = scaler.transform(test_imputed)
+    y_subset_array = y_subset.to_numpy(dtype=int)
+    selected_features = _choose_features(
+        X_subset_scaled,
+        y_subset_array,
+        FEATURES,
     )
+    selected_indices = [FEATURES.index(feature) for feature in selected_features]
 
-    circuit = QuantumCircuit(N_QUBITS)
+    X_quantum = X_subset_scaled[:, selected_indices]
+    X_test_quantum = X_test_scaled[:, selected_indices]
+    X_quantum = np.clip(X_quantum, -2.0, 2.0) * (np.pi / 2.0)
+    X_test_quantum = np.clip(X_test_quantum, -2.0, 2.0) * (np.pi / 2.0)
+    y_test_array = y_test.to_numpy(dtype=int)
 
-    circuit.compose(
-        feature_map,
-        inplace=True
+    circuit, feature_parameters, ansatz_parameters = build_circuit(
+        N_QUBITS,
+        FEATURE_REPS,
+        ANSATZ_REPS,
     )
+    rng = np.random.default_rng(RANDOM_STATE)
+    initial_parameters = rng.uniform(-0.2, 0.2, size=len(ansatz_parameters))
+    loss_history: list[float] = []
+    objective_evaluations = 0
+    optimization_started = time.perf_counter()
 
-    circuit.compose(
-        ansatz,
-        inplace=True
-    )
-
-    # Keep the parameter groups explicitly.
-    feature_parameters = list(feature_map.parameters)
-    ansatz_parameters = list(ansatz.parameters)
-
-    return (
-        circuit,
-        feature_parameters,
-        ansatz_parameters
-    )
-
-
-# =====================================================
-# QUANTUM PROBABILITY
-# =====================================================
-
-def quantum_probability(
-    circuit,
-    feature_parameters,
-    ansatz_parameters,
-    feature_values,
-    weights
-):
-
-    parameter_values = {}
-
-    # Bind input data to feature-map parameters.
-    for parameter, value in zip(
-        feature_parameters,
-        feature_values
-    ):
-
-        parameter_values[parameter] = float(value)
-
-    # Bind trainable weights to ansatz parameters.
-    for parameter, value in zip(
-        ansatz_parameters,
-        weights
-    ):
-
-        parameter_values[parameter] = float(value)
-
-    bound_circuit = circuit.assign_parameters(
-        parameter_values
-    )
-
-    bound_circuit.save_statevector()
-
-    compiled = transpile(
-        bound_circuit,
-        SIMULATOR
-    )
-
-    result = SIMULATOR.run(
-        compiled
-    ).result()
-
-    statevector = np.asarray(
-        result.get_statevector(compiled),
-        dtype=complex
-    )
-
-    # Probability of measuring qubit 0 as |1>.
-    probability = sum(
-        abs(amplitude) ** 2
-        for index, amplitude in enumerate(statevector)
-        if index & 1
-    )
-
-    return float(
-        np.clip(probability, 0.0, 1.0)
-    )
-
-
-# =====================================================
-# MAIN TRAINING FUNCTION
-# =====================================================
-
-def main():
-
-    print("\nLoading shared processed dataset...")
-
-    X_train, X_test, y_train, y_test, metadata = (
-        load_processed()
-    )
-
-    print("Training samples:", len(X_train))
-    print("Testing samples:", len(X_test))
-
-    # -------------------------------------------------
-    # Select four features using training data only.
-    # -------------------------------------------------
-
-    X_train_selected, X_test_selected, selected_features = (
-        select_features(
-            X_train,
-            y_train,
-            X_test
+    def objective(weights: np.ndarray) -> float:
+        nonlocal objective_evaluations
+        probabilities = np.asarray(
+            [
+                quantum_probability(
+                    circuit,
+                    feature_parameters,
+                    ansatz_parameters,
+                    row,
+                    weights,
+                )
+                for row in X_quantum
+            ],
+            dtype=float,
         )
-    )
-
-    print("\nSelected quantum features:")
-
-    for feature in selected_features:
-        print("-", feature)
-
-    # -------------------------------------------------
-    # Select a reproducible training subset.
-    # -------------------------------------------------
-
-    rng = np.random.default_rng(42)
-
-    if len(X_train_selected) > MAX_TRAINING_SAMPLES:
-
-        selected_rows = rng.choice(
-            len(X_train_selected),
-            size=MAX_TRAINING_SAMPLES,
-            replace=False
-        )
-
-        X_quantum = X_train_selected.iloc[
-            selected_rows
-        ].to_numpy()
-
-        y_quantum = y_train.iloc[
-            selected_rows
-        ].to_numpy()
-
-    else:
-
-        X_quantum = X_train_selected.to_numpy()
-        y_quantum = y_train.to_numpy()
-
-    # -------------------------------------------------
-    # Convert features to bounded circuit angles.
-    # -------------------------------------------------
-
-    X_quantum = np.clip(
-        X_quantum,
-        -2,
-        2
-    ) * (np.pi / 2)
-
-    X_test_quantum = np.clip(
-        X_test_selected.to_numpy(),
-        -2,
-        2
-    ) * (np.pi / 2)
-
-    # -------------------------------------------------
-    # Build circuit.
-    # -------------------------------------------------
-
-    (
-        circuit,
-        feature_parameters,
-        ansatz_parameters
-    ) = build_circuit()
-
-    print("\nNumber of qubits:", N_QUBITS)
-    print("Trainable parameters:", len(ansatz_parameters))
-
-    initial_parameters = rng.uniform(
-        -np.pi,
-        np.pi,
-        len(ansatz_parameters)
-    )
-
-    history = []
-
-    # =================================================
-    # OBJECTIVE FUNCTION
-    # =================================================
-
-    def objective(weights):
-
-        probabilities = []
-
-        for features in X_quantum:
-
-            probability = quantum_probability(
-                circuit,
-                feature_parameters,
-                ansatz_parameters,
-                features,
-                weights
-            )
-
-            probabilities.append(probability)
-
-        probabilities = np.clip(
-            probabilities,
-            1e-7,
-            1 - 1e-7
-        )
-
-        # Binary cross-entropy.
+        probabilities = np.clip(probabilities, 1e-7, 1 - 1e-7)
         loss = -np.mean(
-            y_quantum * np.log(probabilities)
-            +
-            (1 - y_quantum) * np.log(1 - probabilities)
+            y_subset_array * np.log(probabilities)
+            + (1 - y_subset_array) * np.log(1 - probabilities)
         )
-
-        history.append(float(loss))
-
+        objective_evaluations += 1
+        loss_history.append(float(loss))
         return float(loss)
 
-    # =================================================
-    # OPTIMISATION
-    # =================================================
-
-    print("\nStarting COBYLA optimisation...")
-
-    optimisation = minimize(
+    optimization = minimize(
         objective,
         initial_parameters,
         method="COBYLA",
-        options={
-            "maxiter": MAX_ITERATIONS,
-            "rhobeg": 0.5
+        options={"maxiter": MAX_ITERATIONS, "rhobeg": 0.5, "tol": 1e-4},
+    )
+    optimization_seconds = time.perf_counter() - optimization_started
+    best_parameters = np.asarray(optimization.x, dtype=float)
+
+    test_probabilities = np.asarray(
+        [
+            quantum_probability(
+                circuit,
+                feature_parameters,
+                ansatz_parameters,
+                row,
+                best_parameters,
+            )
+            for row in X_test_quantum
+        ],
+        dtype=float,
+    )
+    threshold = 0.5
+    test_predictions = (test_probabilities >= threshold).astype(int)
+    metrics = calculate_metrics(y_test_array, test_predictions, test_probabilities)
+    metrics.update(
+        {
+            "threshold": threshold,
+            "training_rows": int(len(X_subset)),
+            "test_rows": int(len(X_test)),
+            "selected_features": selected_features,
+            "n_qubits": N_QUBITS,
+            "feature_reps": FEATURE_REPS,
+            "ansatz_reps": ANSATZ_REPS,
+            "trainable_parameters": len(ansatz_parameters),
+            "optimizer": "COBYLA",
+            "optimizer_success": bool(optimization.success),
+            "optimizer_status": int(optimization.status),
+            "optimizer_message": str(optimization.message),
+            "objective_evaluations": int(objective_evaluations),
+            "final_training_loss": float(optimization.fun),
+            "optimization_seconds": float(optimization_seconds),
+            "simulation": "local exact statevector",
         }
     )
-
-    best_parameters = optimisation.x
-
-    print("\nOptimisation completed.")
-    print("Final loss:", optimisation.fun)
-    print("Optimiser success:", optimisation.success)
-    print("Optimiser message:", optimisation.message)
-
-    # =================================================
-    # TEST EVALUATION
-    # =================================================
-
-    print("\nEvaluating test dataset...")
-
-    y_prob = []
-
-    for features in X_test_quantum:
-
-        probability = quantum_probability(
-            circuit,
-            feature_parameters,
-            ansatz_parameters,
-            features,
-            best_parameters
-        )
-
-        y_prob.append(probability)
-
-    y_prob = np.asarray(y_prob)
-
-    y_pred = (
-        y_prob >= 0.5
-    ).astype(int)
-
-    metrics = calculate_metrics(
-        y_test,
-        y_pred,
-        y_prob
-    )
-
-    print_metrics(
-        "Quantum Machine Learning",
-        metrics
-    )
-
-    print("\nClassification Report:")
-
-    print(
-        classification_report(
-            y_test,
-            y_pred,
-            zero_division=0
-        )
-    )
-
-    # =================================================
-    # SAVE MODEL
-    # =================================================
-
     model_data = {
         "parameters": best_parameters,
-        "features": selected_features,
+        "features": FEATURES,
+        "selected_features": selected_features,
         "n_qubits": N_QUBITS,
-        "feature_parameters": feature_parameters,
-        "ansatz_parameters": ansatz_parameters
+        "feature_reps": FEATURE_REPS,
+        "ansatz_reps": ANSATZ_REPS,
+        "imputer": imputer,
+        "scaler": scaler,
+        "threshold": threshold,
+        "optimizer": "COBYLA",
+        "training_rows": int(len(X_subset)),
+        "training_sample_indices": [int(index) for index in X_subset.index],
+        "metrics": metrics,
     }
-
-    with open(
-        MODEL_DIR / "quantum_model.pkl",
-        "wb"
-    ) as file:
-
-        pickle.dump(
-            model_data,
-            file
-        )
-
-    save_metrics(
-        metrics,
-        RESULT_DIR / "quantum_metrics.json"
-    )
-
-    # =================================================
-    # CONFUSION MATRIX
-    # =================================================
+    with (MODEL_DIR / "quantum_model.pkl").open("wb") as file:
+        pickle.dump(model_data, file)
+    save_metrics(metrics, RESULT_DIR / "quantum_metrics.json")
 
     plot_confusion_matrix(
-        y_test,
-        y_pred,
-        "Quantum Model Confusion Matrix",
-        RESULT_DIR / "quantum_confusion.png"
+        y_test_array,
+        test_predictions,
+        "Quantum model — held-out test",
+        RESULT_DIR / "quantum_confusion.png",
     )
-
-    # =================================================
-    # ROC CURVE
-    # =================================================
-
     plot_roc_curve(
+        y_test_array,
+        test_probabilities,
+        "Quantum model — ROC",
+        RESULT_DIR / "quantum_roc.png",
+    )
+    figure, axis = plt.subplots(figsize=(8, 5))
+    axis.plot(loss_history)
+    axis.set(
+        title="Quantum optimization loss",
+        xlabel="Objective evaluation",
+        ylabel="Training binary cross-entropy",
+    )
+    figure.tight_layout()
+    figure.savefig(RESULT_DIR / "quantum_loss.png", dpi=150)
+    plt.close(figure)
+    circuit.draw(output="mpl", fold=-1)
+    plt.savefig(RESULT_DIR / "quantum_circuit.png", dpi=150, bbox_inches="tight")
+    plt.close("all")
+
+    controlled = _fit_controlled_classical(
+        X_subset.loc[:, selected_features],
+        y_subset,
+        X_test.loc[:, selected_features],
         y_test,
-        y_prob,
-        "Quantum Model ROC Curve",
-        RESULT_DIR / "quantum_roc.png"
     )
-
-    # =================================================
-    # LOSS CURVE
-    # =================================================
-
-    plt.figure(figsize=(8, 5))
-
-    plt.plot(
-        history,
-        marker="o"
+    controlled.update(
+        {
+            "selected_features": selected_features,
+            "comparison_design": (
+                "Same stratified training subset, held-out test split, and selected "
+                "four input features as the quantum classifier."
+            ),
+        }
     )
-
-    plt.title("Quantum Optimisation Loss")
-    plt.xlabel("Objective Evaluation")
-    plt.ylabel("Binary Cross-Entropy Loss")
-
-    plt.tight_layout()
-
-    plt.savefig(
-        RESULT_DIR / "quantum_loss.png",
-        dpi=150
+    save_metrics(controlled, RESULT_DIR / "controlled_classical_metrics.json")
+    print(
+        f"Quantum test ROC-AUC={metrics['roc_auc']:.3f}, "
+        f"PR-AUC={metrics['pr_auc']:.3f}, recall={metrics['recall']:.3f}, "
+        f"F1={metrics['f1_score']:.3f}"
     )
-
-    plt.close()
-
-    # =================================================
-    # QUANTUM CIRCUIT DIAGRAM
-    # =================================================
-
-    circuit.draw(
-        output="mpl",
-        fold=-1
+    print(
+        f"COBYLA status={optimization.status}: {optimization.message}; "
+        f"evaluations={objective_evaluations}; runtime={optimization_seconds:.1f}s"
     )
+    return {"quantum": metrics, "controlled_classical": controlled}
 
-    plt.savefig(
-        RESULT_DIR / "quantum_circuit.png",
-        dpi=150,
-        bbox_inches="tight"
-    )
 
-    plt.close()
-
-    print("\n" + "=" * 50)
-    print("QUANTUM TRAINING COMPLETED")
-    print("=" * 50)
-
-    print("\nModel saved in:", MODEL_DIR)
-    print("Results saved in:", RESULT_DIR)
+def main() -> None:
+    train_quantum()
+    print(f"Quantum model saved in: {MODEL_DIR}")
+    print(f"Quantum evaluation results saved in: {RESULT_DIR}")
 
 
 if __name__ == "__main__":
