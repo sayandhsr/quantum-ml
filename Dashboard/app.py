@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +23,15 @@ from quantum.model import predict_quantum_probability
 from quantum.drqnn import QiskitDataReuploadingClassifier, build_drqnn_circuit
 from shared.preprocess import FEATURES, TARGET, load_raw_dataset, split_dataset
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    f1_score,
+    confusion_matrix,
+    roc_curve,
+    precision_score,
+    recall_score,
+)
 from sklearn.datasets import make_circles, make_moons
 
 CLASSICAL_MODELS = ROOT / "traditional" / "models"
@@ -719,113 +729,327 @@ def _page_enhanced_quantum(frame: pd.DataFrame | None) -> None:
     ])
 
     with tab_diabetes:
-        st.subheader("Real-World Diabetes Classification (Pima Indians)")
-        st.caption("Trains the 4-qubit Enhanced DR-QNN on the 500-record dataset with mutual-information selected clinical features.")
+        st.subheader("Interactive Quantum Classification Engine")
+        st.caption("Provide data directly or upload custom CSV, execute the quantum training command, and inspect live results and visual analysis in-place.")
 
-        col_ctrl, col_pred = st.columns([1, 1])
+        data_source = st.selectbox(
+            "Select Data Source",
+            ["Default Dataset (Pima Indians Diabetes)", "Upload Custom CSV Dataset"],
+            key="drqnn_data_source_select",
+        )
 
-        with col_ctrl:
-            st.markdown("**Model Hyperparameters**")
-            n_layers = st.slider("Re-uploading layers", 1, 3, 2, key="drqnn_layers")
-            epochs = st.slider("Optimization epochs", 10, 40, 20, step=5, key="drqnn_epochs")
-            lr = st.select_slider("Learning rate (Adam)", options=[0.03, 0.05, 0.08, 0.10], value=0.08, key="drqnn_lr")
-            batch_size = st.select_slider("Batch size", options=[16, 25, 32, 50], value=32, key="drqnn_bs")
+        active_df: pd.DataFrame | None = None
+        current_dataset_id = ""
 
-            train_btn = st.button("Train Enhanced DR-QNN Now", type="primary", use_container_width=True)
-
-        if "drqnn_model" not in st.session_state:
-            st.session_state["drqnn_model"] = None
-            st.session_state["drqnn_history"] = None
-            st.session_state["drqnn_scaler"] = None
-            st.session_state["drqnn_metrics"] = None
-
-        if train_btn and frame is not None:
-            with st.spinner("Training Enhanced Qiskit DR-QNN with vectorized batch engine..."):
-                t_start = time.time()
-                X_train, X_test, y_train, y_test = split_dataset(frame)
-                selected_features = ["Glucose", "BMI", "Age", "DiabetesPedigreeFunction"]
-                scaler = StandardScaler()
-                X_tr = scaler.fit_transform(X_train[selected_features])
-                X_te = scaler.transform(X_test[selected_features])
-
-                model = QiskitDataReuploadingClassifier(
-                    n_qubits=4,
-                    n_layers=n_layers,
-                    learning_rate=lr,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    random_state=42,
-                )
-                history = model.fit(X_tr, y_train.values, X_te, y_test.values)
-                y_pred = model.predict(X_te)
-                y_prob = model.predict_proba(X_te)[:, 1]
-                duration = time.time() - t_start
-
-                acc = float(accuracy_score(y_test, y_pred))
-                roc = float(roc_auc_score(y_test, y_prob))
-                f1 = float(f1_score(y_test, y_pred, zero_division=0))
-                cm = confusion_matrix(y_test, y_pred, labels=[0, 1]).tolist()
-
-                st.session_state["drqnn_model"] = model
-                st.session_state["drqnn_scaler"] = scaler
-                st.session_state["drqnn_history"] = history
-                st.session_state["drqnn_metrics"] = {
-                    "accuracy": acc,
-                    "roc_auc": roc,
-                    "f1": f1,
-                    "cm": cm,
-                    "duration": duration,
-                }
-                st.success(f"Training completed in {duration:.2f} seconds!")
-
-        if st.session_state["drqnn_metrics"] is not None:
-            m = st.session_state["drqnn_metrics"]
-            m_cols = st.columns(4)
-            m_cols[0].metric("Accuracy", f"{m['accuracy']:.1%}")
-            m_cols[1].metric("ROC-AUC", f"{m['roc_auc']:.3f}")
-            m_cols[2].metric("F1 Score", f"{m['f1']:.3f}")
-            m_cols[3].metric("Training Time", f"{m['duration']:.2f}s")
-
-            st.divider()
-            p_left, p_right = st.columns(2)
-            with p_left:
-                st.subheader("Training Loss Convergence")
-                loss_df = pd.DataFrame({
-                    "Epoch": list(range(1, len(st.session_state["drqnn_history"]["loss"]) + 1)),
-                    "Loss": st.session_state["drqnn_history"]["loss"],
-                })
-                fig_loss = px.line(loss_df, x="Epoch", y="Loss", title="Cross-Entropy Loss", color_discrete_sequence=[QUANTUM_COLOR])
-                st.plotly_chart(_plot_layout(fig_loss), width="stretch")
-
-            with p_right:
-                st.subheader("Confusion Matrix (Test Set)")
-                cm = m["cm"]
-                cm_df = pd.DataFrame(cm, index=["Actual Negative", "Actual Positive"], columns=["Pred Negative", "Pred Positive"])
-                fig_cm = px.imshow(cm_df, text_auto=True, color_continuous_scale="Purples", title="Test Confusion Matrix")
-                st.plotly_chart(_plot_layout(fig_cm), width="stretch")
-
-        with col_pred:
-            st.markdown("**Live Interactive Patient Predictor**")
-            st.caption("Adjust patient metrics to compute real-time calibrated quantum probability:")
-            p_glucose = st.slider("Glucose (mg/dL)", 50.0, 220.0, 125.0, key="drqnn_glu")
-            p_bmi = st.slider("Body Mass Index (BMI)", 15.0, 55.0, 31.0, key="drqnn_bmi")
-            p_age = st.slider("Age (Years)", 18.0, 85.0, 35.0, key="drqnn_age")
-            p_pedigree = st.slider("Diabetes Pedigree Score", 0.05, 2.50, 0.45, key="drqnn_ped")
-
-            if st.session_state["drqnn_model"] is not None and st.session_state["drqnn_scaler"] is not None:
-                raw_input = np.array([[p_glucose, p_bmi, p_age, p_pedigree]])
-                scaled_input = st.session_state["drqnn_scaler"].transform(raw_input)
-                q_probs = st.session_state["drqnn_model"].predict_proba(scaled_input)[0]
-                pos_prob = float(q_probs[1])
-
-                st.markdown(f"**Predicted Positive Risk:** `{pos_prob:.1%}`")
-                st.progress(pos_prob)
-                if pos_prob >= 0.5:
-                    st.error(f"High Predicted Risk ({pos_prob:.1%}) - Positive class")
-                else:
-                    st.success(f"Low Predicted Risk ({pos_prob:.1%}) - Negative class")
+        if data_source == "Default Dataset (Pima Indians Diabetes)":
+            active_df = frame
+            current_dataset_id = "default_pima_500"
+        else:
+            uploaded_file = st.file_uploader(
+                "Upload Custom CSV File",
+                type=["csv"],
+                key="drqnn_csv_uploader",
+                help="Upload any 2-class tabular CSV dataset to classify with the Quantum Neural Network.",
+            )
+            if uploaded_file is not None:
+                try:
+                    active_df = pd.read_csv(uploaded_file)
+                    current_dataset_id = f"uploaded_{uploaded_file.name}_{uploaded_file.size}"
+                except Exception as err:
+                    st.error(f"Failed to parse CSV file: {err}")
+                    active_df = None
             else:
-                st.info("Train the Enhanced DR-QNN above to enable live real-time predictions.")
+                active_df = None
+                current_dataset_id = "no_upload"
+
+        previous_dataset_id = st.session_state.get("drqnn_dataset_id", "")
+        if current_dataset_id != previous_dataset_id:
+            st.session_state["drqnn_model"] = None
+            st.session_state["drqnn_scaler"] = None
+            st.session_state["drqnn_history"] = None
+            st.session_state["drqnn_metrics"] = None
+            st.session_state["drqnn_features"] = None
+            st.session_state["drqnn_target"] = None
+            st.session_state["drqnn_y_test"] = None
+            st.session_state["drqnn_y_prob"] = None
+            st.session_state["drqnn_dataset_id"] = current_dataset_id
+            if previous_dataset_id != "":
+                st.info("New dataset detected! Previous model training, results, and images have been removed.")
+
+        if active_df is not None:
+            with st.expander("Dataset Preview & Schema Details", expanded=True):
+                st.dataframe(active_df.head(6), use_container_width=True)
+                st.caption(f"Shape: {active_df.shape[0]} rows × {active_df.shape[1]} columns")
+
+            if data_source == "Default Dataset (Pima Indians Diabetes)":
+                target_col = TARGET
+                selected_features = ["Glucose", "BMI", "Age", "DiabetesPedigreeFunction"]
+            else:
+                cols = list(active_df.columns)
+                default_target_idx = len(cols) - 1
+                for idx, c in enumerate(cols):
+                    if str(c).lower() in ["outcome", "target", "label", "class", "diagnosis"]:
+                        default_target_idx = idx
+                        break
+                target_col = st.selectbox(
+                    "Target Column (Binary 0/1)",
+                    options=cols,
+                    index=default_target_idx,
+                    key="drqnn_target_select",
+                )
+                numeric_cols = [
+                    c for c in cols
+                    if c != target_col and pd.api.types.is_numeric_dtype(active_df[c])
+                ]
+                default_feats = numeric_cols[:4] if len(numeric_cols) >= 4 else numeric_cols
+                selected_features = st.multiselect(
+                    "Selected Features for Quantum Circuit (up to 4 qubits recommended)",
+                    options=numeric_cols,
+                    default=default_feats,
+                    key="drqnn_feat_select",
+                )
+
+            if not selected_features or target_col not in active_df.columns:
+                st.warning("Please select at least 1 feature and a valid target column.")
+            else:
+                col_ctrl, col_cmd = st.columns([1, 1])
+                with col_ctrl:
+                    st.markdown("**Model Hyperparameters**")
+                    n_layers = st.slider("Re-uploading layers", 1, 3, 2, key="drqnn_layers")
+                    epochs = st.slider("Optimization epochs", 10, 40, 20, step=5, key="drqnn_epochs")
+                    lr = st.select_slider(
+                        "Learning rate (Adam)",
+                        options=[0.03, 0.05, 0.08, 0.10],
+                        value=0.08,
+                        key="drqnn_lr",
+                    )
+                    batch_size = st.select_slider(
+                        "Batch size",
+                        options=[16, 25, 32, 50],
+                        value=32,
+                        key="drqnn_bs",
+                    )
+
+                with col_cmd:
+                    st.markdown("**Quantum Execution Command**")
+                    cmd_preview = (
+                        f"# Python / Qiskit DR-QNN Command\n"
+                        f"model = QiskitDataReuploadingClassifier(\n"
+                        f"    n_qubits={len(selected_features)},\n"
+                        f"    n_layers={n_layers},\n"
+                        f"    learning_rate={lr},\n"
+                        f"    epochs={epochs},\n"
+                        f"    batch_size={batch_size}\n"
+                        f")\n"
+                        f"model.fit(X_train, y_train)\n"
+                        f"y_pred = model.predict(X_test)\n"
+                        f"y_prob = model.predict_proba(X_test)[:, 1]"
+                    )
+                    st.code(cmd_preview, language="python")
+                    train_btn = st.button("Run Quantum DR-QNN Command", type="primary", use_container_width=True)
+
+                if train_btn:
+                    with st.spinner("Training Enhanced Qiskit DR-QNN with vectorized batch engine..."):
+                        t_start = time.time()
+                        clean_df = active_df.dropna(subset=selected_features + [target_col])
+                        y_raw = clean_df[target_col].values
+                        unique_y = np.unique(y_raw)
+                        if len(unique_y) != 2:
+                            st.error(f"Target column must have exactly 2 classes, found {len(unique_y)} classes: {unique_y}")
+                        else:
+                            y_binary = (y_raw == unique_y[1]).astype(int)
+                            X_raw = clean_df[selected_features].values
+
+                            from sklearn.model_selection import train_test_split
+                            X_train, X_test, y_train, y_test = train_test_split(
+                                X_raw, y_binary, test_size=0.2, random_state=42, stratify=y_binary
+                            )
+
+                            scaler = StandardScaler()
+                            X_tr = scaler.fit_transform(X_train)
+                            X_te = scaler.transform(X_test)
+
+                            n_q = len(selected_features)
+                            model = QiskitDataReuploadingClassifier(
+                                n_qubits=n_q,
+                                n_layers=n_layers,
+                                learning_rate=lr,
+                                epochs=epochs,
+                                batch_size=batch_size,
+                                random_state=42,
+                            )
+                            history = model.fit(X_tr, y_train, X_te, y_test)
+                            y_pred = model.predict(X_te)
+                            y_prob = model.predict_proba(X_te)[:, 1]
+                            duration = time.time() - t_start
+
+                            acc = float(accuracy_score(y_test, y_pred))
+                            try:
+                                roc = float(roc_auc_score(y_test, y_prob))
+                            except Exception:
+                                roc = 0.5
+                            f1 = float(f1_score(y_test, y_pred, zero_division=0))
+                            prec = float(precision_score(y_test, y_pred, zero_division=0))
+                            rec = float(recall_score(y_test, y_pred, zero_division=0))
+                            cm = confusion_matrix(y_test, y_pred, labels=[0, 1]).tolist()
+                            fpr, tpr, _ = roc_curve(y_test, y_prob)
+
+                            st.session_state["drqnn_model"] = model
+                            st.session_state["drqnn_scaler"] = scaler
+                            st.session_state["drqnn_history"] = history
+                            st.session_state["drqnn_features"] = selected_features
+                            st.session_state["drqnn_target"] = target_col
+                            st.session_state["drqnn_y_test"] = y_test.tolist()
+                            st.session_state["drqnn_y_prob"] = y_prob.tolist()
+                            st.session_state["drqnn_metrics"] = {
+                                "accuracy": acc,
+                                "roc_auc": roc,
+                                "f1": f1,
+                                "precision": prec,
+                                "recall": rec,
+                                "cm": cm,
+                                "duration": duration,
+                                "fpr": fpr.tolist(),
+                                "tpr": tpr.tolist(),
+                            }
+                            st.success(f"Training completed in {duration:.2f} seconds!")
+
+                if st.session_state.get("drqnn_metrics") is not None:
+                    m = st.session_state["drqnn_metrics"]
+                    st.divider()
+                    st.subheader("Training Results & Quantum Model Performance")
+
+                    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+                    kpi1.metric("Accuracy", f"{m['accuracy']:.1%}")
+                    kpi2.metric("ROC-AUC", f"{m['roc_auc']:.3f}")
+                    kpi3.metric("F1 Score", f"{m['f1']:.3f}")
+                    kpi4.metric("Precision", f"{m['precision']:.3f}")
+                    kpi5.metric("Recall", f"{m['recall']:.3f}")
+                    kpi6.metric("Time", f"{m['duration']:.2f}s")
+
+                    st.markdown("#### Visual Analysis & Result Plots")
+                    img_row1_col1, img_row1_col2 = st.columns(2)
+
+                    with img_row1_col1:
+                        cm = m["cm"]
+                        cm_df = pd.DataFrame(
+                            cm,
+                            index=["Actual Class 0", "Actual Class 1"],
+                            columns=["Pred Class 0", "Pred Class 1"],
+                        )
+                        fig_cm = px.imshow(
+                            cm_df,
+                            text_auto=True,
+                            color_continuous_scale="Purples",
+                            title="1. Confusion Matrix (Test Set)",
+                        )
+                        fig_cm.update_layout(coloraxis_showscale=False)
+                        st.plotly_chart(_plot_layout(fig_cm), width="stretch")
+
+                    with img_row1_col2:
+                        fpr = m["fpr"]
+                        tpr = m["tpr"]
+                        fig_roc = go.Figure()
+                        fig_roc.add_trace(go.Scatter(
+                            x=fpr,
+                            y=tpr,
+                            mode="lines",
+                            name=f"DR-QNN (AUC = {m['roc_auc']:.3f})",
+                            line=dict(color=QUANTUM_COLOR, width=3),
+                        ))
+                        fig_roc.add_trace(go.Scatter(
+                            x=[0, 1],
+                            y=[0, 1],
+                            mode="lines",
+                            name="Random Guess",
+                            line=dict(color="#888888", dash="dash"),
+                        ))
+                        fig_roc.update_layout(
+                            title=f"2. ROC Curve (AUC = {m['roc_auc']:.3f})",
+                            xaxis_title="False Positive Rate",
+                            yaxis_title="True Positive Rate",
+                            yaxis=dict(range=[0, 1.05]),
+                            xaxis=dict(range=[0, 1.05]),
+                        )
+                        st.plotly_chart(_plot_layout(fig_roc), width="stretch")
+
+                    img_row2_col1, img_row2_col2 = st.columns(2)
+
+                    with img_row2_col1:
+                        loss_hist = st.session_state["drqnn_history"]["loss"]
+                        loss_df = pd.DataFrame({
+                            "Epoch": list(range(1, len(loss_hist) + 1)),
+                            "Cross-Entropy Loss": loss_hist,
+                        })
+                        fig_loss = px.line(
+                            loss_df,
+                            x="Epoch",
+                            y="Cross-Entropy Loss",
+                            title="3. Cross-Entropy Loss Convergence",
+                            color_discrete_sequence=[QUANTUM_COLOR],
+                        )
+                        st.plotly_chart(_plot_layout(fig_loss), width="stretch")
+
+                    with img_row2_col2:
+                        y_test_arr = np.array(st.session_state["drqnn_y_test"])
+                        y_prob_arr = np.array(st.session_state["drqnn_y_prob"])
+                        prob_df = pd.DataFrame({
+                            "Predicted Probability": y_prob_arr,
+                            "Actual Class": [f"Class {val}" for val in y_test_arr],
+                        })
+                        fig_hist = px.histogram(
+                            prob_df,
+                            x="Predicted Probability",
+                            color="Actual Class",
+                            barmode="overlay",
+                            nbins=20,
+                            opacity=0.75,
+                            title="4. Calibrated Probability Distribution",
+                            color_discrete_map={"Class 0": "#26736b", "Class 1": "#7656a5"},
+                        )
+                        st.plotly_chart(_plot_layout(fig_hist), width="stretch")
+
+                    st.divider()
+                    st.subheader("Live Interactive Prediction on Active Model")
+                    st.caption("Adjust input values to compute real-time calibrated quantum probability:")
+
+                    live_clean_df = active_df.dropna(subset=selected_features)
+                    feat_cols = st.columns(min(len(selected_features), 4))
+                    live_inputs = {}
+                    for i, feat in enumerate(selected_features):
+                        col_target = feat_cols[i % len(feat_cols)]
+                        feat_vals = live_clean_df[feat].dropna()
+                        min_v = float(feat_vals.min()) if len(feat_vals) > 0 else 0.0
+                        max_v = float(feat_vals.max()) if len(feat_vals) > 0 else 100.0
+                        med_v = float(feat_vals.median()) if len(feat_vals) > 0 else (min_v + max_v) / 2.0
+                        if min_v == max_v:
+                            max_v = min_v + 1.0
+                        with col_target:
+                            label_str = FEATURE_LABELS.get(feat, feat)
+                            live_inputs[feat] = st.slider(
+                                label_str,
+                                min_value=min_v,
+                                max_value=max_v,
+                                value=med_v,
+                                key=f"drqnn_live_{feat}",
+                            )
+
+                    raw_sample = np.array([[live_inputs[f] for f in selected_features]])
+                    scaled_sample = st.session_state["drqnn_scaler"].transform(raw_sample)
+                    pred_probs = st.session_state["drqnn_model"].predict_proba(scaled_sample)[0]
+                    p_pos = float(pred_probs[1])
+
+                    col_prob, col_bar = st.columns([1, 2])
+                    with col_prob:
+                        st.metric("Predicted Positive Risk", f"{p_pos:.1%}")
+                    with col_bar:
+                        st.progress(p_pos)
+                        if p_pos >= 0.5:
+                            st.error(f"High Risk Alert ({p_pos:.1%}) - Predicted Positive")
+                        else:
+                            st.success(f"Low Risk ({p_pos:.1%}) - Predicted Negative")
+        else:
+            st.info("Upload a CSV dataset or select the default dataset to begin.")
 
     with tab_benchmark:
         st.subheader("Geometric Non-Linearity Benchmark")
